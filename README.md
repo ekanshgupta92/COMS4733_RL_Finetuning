@@ -119,6 +119,12 @@ dataset/
 ```
 Approximately 20 % of the episodes are generated with `hindered=True`, adding lighting perturbations and occluders.
 
+## Create stats
+```bash
+python utils/compute_stats.py
+```
+This calculates the mean and standard deviation of the actions in the dataset. Without this, the model cannot normalize inputs correctly, leading to poor performance (especially for the gripper).
+
 ## Validate Dataset
 ```bash
 python data/validate_dataset_schema.py --dataset ./dataset
@@ -173,17 +179,20 @@ Milestone 2 will fine-tune this BC policy with PPO using the same MuJoCo environ
 # 1. Collect demonstrations
 python data/collect_demos_lerobot.py --episodes 500
 
-# 2. Validate dataset
+# 2. Create stats 
+python  utils/compute_stats.py
+
+# 3. Validate dataset
 python data/validate_dataset_schema.py --dataset ./dataset
 
-# 3. Train BC model
+# 4. Train BC model
 python train_bc.py --config configs/openvla_dinov2_bc.yaml
 
-# 4. Evaluate
+# 5. Evaluate
 python evaluate_bc_mujoco.py --mode static
 python evaluate_bc_mujoco.py --mode hindered
 
-# 5. View report
+# 6. View report
 open reports/milestone1_report.md
 ```
 

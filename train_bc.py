@@ -208,7 +208,7 @@ def main() -> None:
 def train_one_epoch(
     model: VLADinoV2Policy,
     dataloader: DataLoader,
-    criterion: nn.Module,
+    criterion: nn.Module, # We will ignore this passed criterion
     optimizer: optim.Optimizer,
     device: torch.device,
     log_interval: int,
@@ -221,29 +221,39 @@ def train_one_epoch(
     tracker = MetricTracker()
     use_amp = scaler is not None
 
+    # Define specific losses
+    arm_criterion = nn.L1Loss() # MAE is often better for imitation
+    gripper_criterion = nn.BCEWithLogitsLoss() 
+
     for step, batch in enumerate(dataloader, start=1):
         rgb = batch["rgb_static"].to(device)
         proprio = batch["proprio"].to(device)
         target = batch["action"].to(device)
-        action_history = batch.get("action_history")
-        if action_history is not None:
-            action_history = action_history.to(device)
-        instructions = batch.get("instruction")
-        if instructions is None:
-            instructions = [""] * rgb.size(0)
+        
+        # Split Target
+        target_arm = target[:, :7]
+        target_gripper = target[:, 7:8]
+        
+        # Convert continuous gripper target (0.0 or 0.04) to Binary Class (0.0 or 1.0)
+        batch_mean_gripper = target_gripper.mean() 
+        target_gripper_bin = (target_gripper > batch_mean_gripper).float()
+
+        instructions = batch.get("instruction", [""] * rgb.size(0))
+        action_history = batch.get("action_history").to(device) if batch.get("action_history") is not None else None
 
         optimizer.zero_grad()
-        
+
         # Mixed precision forward pass
         with autocast(enabled=use_amp):
-            pred = model(rgb_static=rgb, proprio=proprio, instruction=instructions, action_history=action_history)
+            # Model returns [arm (7), gripper_logit (1)]
+            preds = model(rgb_static=rgb, proprio=proprio, instruction=instructions, action_history=action_history)
             
-            # Compute weighted loss with HIGHER gripper weighting
-            # Need strong emphasis on gripper to learn open/close behavior
-            gripper_weight = 10.0  # Fixed high weight (not adaptive)
+            pred_arm = preds[:, :7]
+            pred_gripper_logit = preds[:, 7:8]
             
-            joint_loss = criterion(pred[:, :7], target[:, :7])
-            gripper_loss = criterion(pred[:, 7:8], target[:, 7:8])
+            # --- HYBRID LOSS CALCULATION ---
+            loss_arm = arm_criterion(pred_arm, target_arm)
+            loss_gripper = gripper_criterion(pred_gripper_logit, target_gripper_bin)
             
             # Multi-task learning: Add object detection auxiliary loss
             # This forces the model to learn explicit visual grounding before action prediction
@@ -275,12 +285,12 @@ def train_one_epoch(
             #     smoothness_loss = (action_diffs ** 2).mean()
             
             # Combined loss: action prediction + object detection
-            loss = joint_loss + gripper_weight * gripper_loss + object_detection_weight * object_detection_loss
+            loss = loss_arm + (5.0 * loss_gripper) + (model.config.object_detection_weight * object_detection_loss)
         
         # Safety: Skip batch if loss is non-finite (NaN or Inf)
         if not torch.isfinite(loss):
             get_logger("train_bc").warning(f"Skipping batch with non-finite loss at epoch {epoch}, step {step}")
-            get_logger("train_bc").warning(f"  joint_loss={joint_loss.item():.4f}, gripper_loss={gripper_loss.item():.4f}, obj_det_loss={object_detection_loss.item():.4f}")
+            get_logger("train_bc").warning(f"  arm_loss={loss_arm.item():.4f}, gripper_loss={loss_gripper.item():.4f}, obj_det_loss={object_detection_loss.item():.4f}")
             continue
         
         # Backward pass with gradient scaling

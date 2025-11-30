@@ -429,7 +429,7 @@ class KeyframeController:
     ):
         """
         Initialize keyframe controller.
-        
+
         Args:
             keyframes: Dictionary mapping keyframe names to joint configurations
             convergence_threshold: Joint position error threshold to consider converged
@@ -438,15 +438,17 @@ class KeyframeController:
         self.keyframes = keyframes
         self.convergence_threshold = convergence_threshold
         self.velocity_threshold = velocity_threshold
-        
+
         # Current state
         self.current_keyframe_idx = 0
         self.keyframe_sequence = []  # Will be set via set_sequence
+        self.sequence_complete = False  # Track if final keyframe has been completed
         
     def set_sequence(self, sequence: list[str]) -> None:
         """Set the sequence of keyframes to execute."""
         self.keyframe_sequence = sequence
         self.current_keyframe_idx = 0
+        self.sequence_complete = False
         
     def get_current_target(self) -> tuple[str, np.ndarray]:
         """Get the current target keyframe name and joint configuration."""
@@ -486,18 +488,21 @@ class KeyframeController:
     def advance_to_next_keyframe(self) -> bool:
         """
         Advance to the next keyframe in the sequence.
-        
+
         Returns:
             True if advanced, False if already at last keyframe
         """
         if self.current_keyframe_idx < len(self.keyframe_sequence) - 1:
             self.current_keyframe_idx += 1
             return True
-        return False
+        else:
+            # Attempted to advance from last keyframe - mark sequence complete
+            self.sequence_complete = True
+            return False
     
     def is_sequence_complete(self) -> bool:
-        """Check if we've reached the end of the keyframe sequence."""
-        return self.current_keyframe_idx >= len(self.keyframe_sequence) - 1
+        """Check if we've completed the entire keyframe sequence."""
+        return self.sequence_complete
     
     def get_progress(self) -> tuple[int, int]:
         """Get current progress (current_idx, total_keyframes)."""

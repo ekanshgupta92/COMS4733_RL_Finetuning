@@ -50,11 +50,7 @@ def world_to_image_coords(obj_pos_3d: np.ndarray, workspace_bounds: tuple = None
     x_norm = (x_world - x_min) / (x_max - x_min)
     y_norm = (y_world - y_min) / (y_max - y_min)
     
-    # Clamp to [0, 1] to handle objects slightly outside bounds
-    x_norm = float(np.clip(x_norm, 0.0, 1.0))
-    y_norm = float(np.clip(y_norm, 0.0, 1.0))
-    
-    return np.array([x_norm, y_norm], dtype=np.float32)
+    return np.array([np.clip(x_norm, 0.0, 1.0), np.clip(y_norm, 0.0, 1.0)], dtype=np.float32)
 
 
 @dataclass(slots=True)
@@ -101,14 +97,16 @@ def compute_adaptive_keyframes(
     env: FrankaPickPlaceEnv,
     object_pos: np.ndarray,
     kin_helper: KinematicsHelper,
+    noisy_object_pos: np.ndarray = None,
 ) -> dict[str, np.ndarray]:
     """Compute keyframes adapted to actual object position using IK.
-    
+
     Args:
         env: The environment instance
-        object_pos: 3D position of the target object
+        object_pos: 3D position of the target object (actual/ground truth)
         kin_helper: Kinematics helper for IK computation
-    
+        noisy_object_pos: Optional noisy position for diverse approach trajectories
+
     Returns:
         Dictionary mapping keyframe names to 7D joint configurations
     """
@@ -118,44 +116,31 @@ def compute_adaptive_keyframes(
         "pre_grasp": np.array([0.1, 0.35, -0.1, -2.05, 0.0, 2.0, -0.5]),
         "grasp": np.array([0.0, 0.675, 0.0, -1.9, 0.0, 2.0, -0.5]),
     }
-    
-    # Reference object position that base keyframes were designed for
-    reference_pos = np.array([0.5, 0.0, 0.03])
-    
-    # Compute offset from reference position
-    offset = object_pos - reference_pos
-    
-    print(f"  Object at {object_pos}, offset from reference: {offset}")
-    
-    # Compute adaptive keyframes using IK
-    keyframes = {}
-    keyframes["home"] = base_keyframes["home"]  # Home doesn't change
-    
-    # Target positions for pick sequence (adjusted for actual object)
-    # Ball: radius = 0.03m (3cm), center at object_pos
-    # 
-    # Edge case handling: When ball is near bin (high Y), use lower grasp for better vertical alignment
+
+    # Use noisy position for pre_grasp (approach diversity), actual position for grasp
+    approach_pos = noisy_object_pos if noisy_object_pos is not None else object_pos
+
     bin_y = 0.45
-    distance_to_bin = abs(object_pos[1] - bin_y)
-    ball_near_bin = distance_to_bin < 0.35  # Within 35cm of bin
-    
+    ball_near_bin = abs(object_pos[1] - bin_y) < 0.35
+
     if ball_near_bin:
-        # Lower grasp height for better vertical alignment at high Y positions
-        pre_grasp_height = 0.12   # 12cm above
-        grasp_height = 0.010      # 1cm above (lower for more vertical approach)
-        print(f"  ⚠ Ball near bin (dist={distance_to_bin*1000:.0f}mm) - using lower grasp height")
+        pre_grasp_height = 0.15
+        grasp_height = 0.010
+        print(f"  ⚠ Ball near bin - using careful grasp")
     else:
-        # Standard heights
-        pre_grasp_height = 0.12   # 12cm above
-        grasp_height = 0.015      # 1.5cm above
-    
+        pre_grasp_height = 0.12
+        # --- FIX 1: LOWER GRASP HEIGHT ---
+        # 0.015 was grabbing the top. 0.01 grabs the "waist" of the ball.
+        grasp_height = 0.010
+
+    # Pre-grasp uses noisy position for diversity, grasp uses actual position
     target_positions = {
-        "pre_grasp": object_pos + np.array([0, 0, pre_grasp_height]),
-        "grasp": object_pos + np.array([0, 0, grasp_height]),
+        "pre_grasp": approach_pos + np.array([0, 0, pre_grasp_height]),
+        "grasp": object_pos + np.array([0, 0, grasp_height]),  # Always use actual position
     }
     
-    # Downward orientation for grasping
-    downward_quat = np.array([0.0, 1.0, 0.0, 0.0])  # Gripper pointing down
+    downward_quat = np.array([0.0, 1.0, 0.0, 0.0])
+    keyframes = {"home": base_keyframes["home"]}
     
     # Compute pre_grasp and grasp using IK
     for keyframe_name, target_pos in target_positions.items():
@@ -164,105 +149,84 @@ def compute_adaptive_keyframes(
         
         use_ik = False
         
-        # For balls near bin, use stricter orientation tolerance and higher orientation weight
-        if ball_near_bin:
-            orientation_tolerance = math.radians(20.0)  # Stricter: 20° vs 30°
-            ori_weight_ccd = 1.5  # Higher orientation priority
-            ori_weight_standard = 0.5
-        else:
-            orientation_tolerance = math.radians(30.0)  # Standard: 30°
-            ori_weight_ccd = 0.5
-            ori_weight_standard = 0.1
-        
-        # Try multiple IK methods for better convergence
         for method in ["ccd", "standard", "staged"]:
             try:
                 if method == "ccd":
-                    # CCD IK - often more robust for difficult positions
                     result_q = kin_helper.inverse_kinematics_ccd(
-                        target_pos=target_pos,
-                        target_quat=downward_quat,
-                        initial_q=initial_q,
-                        max_iters=200,
-                        tol_pos=1e-2,  # 10mm tolerance
-                        tol_ori=orientation_tolerance,
-                        position_weight=20.0,  # Heavy position priority
-                        orientation_weight=ori_weight_ccd,
+                        target_pos=target_pos, target_quat=downward_quat, initial_q=initial_q,
+                        max_iters=200, tol_pos=0.015, position_weight=20.0
                     )
                 elif method == "standard":
-                    # Standard IK with adaptive orientation weighting
                     result_q = kin_helper.inverse_kinematics(
-                        target_pos=target_pos,
-                        target_quat=downward_quat,
-                        initial_q=initial_q,
-                        max_iters=300,
-                        tol_pos=1e-2,  # 10mm tolerance
-                        tol_ori=orientation_tolerance,
-                        damping=5e-4,
-                        step_size=0.3,
-                        position_weight=50.0,  # Massively prioritize position
-                        orientation_weight=ori_weight_standard,
+                        target_pos=target_pos, target_quat=downward_quat, initial_q=initial_q,
+                        max_iters=300, tol_pos=0.015, damping=5e-4
                     )
                 elif method == "staged":
-                    # Staged IK that adapts weighting
-                    horizontal_dist = np.linalg.norm(offset[:2])
+                    dist = np.linalg.norm(object_pos[:2])
                     result_q = kin_helper.inverse_kinematics_staged(
-                        target_pos=target_pos,
-                        target_quat=downward_quat,
-                        initial_q=initial_q,
-                        horizontal_distance=horizontal_dist,
-                        max_iters=200,
-                        damping=1e-3,
+                        target_pos=target_pos, target_quat=downward_quat, initial_q=initial_q,
+                        horizontal_distance=dist, max_iters=200
                     )
                 
-                # Validate result
-                check_pos, check_quat = kin_helper.forward_kinematics(result_q)
-                pos_error = np.linalg.norm(check_pos - target_pos)
-                
-                if pos_error < 0.02:  # Within 20mm
+                check_pos, _ = kin_helper.forward_kinematics(result_q)
+                if np.linalg.norm(check_pos - target_pos) < 0.025:
                     keyframes[keyframe_name] = result_q
                     use_ik = True
-                    print(f"  ✓ IK ({method}) converged for '{keyframe_name}' (error: {pos_error*1000:.1f}mm)")
-                    break  # Success, stop trying other methods
-                    
+                    break
             except Exception:
-                continue  # Try next method
+                continue
         
         if not use_ik:
-            # Fallback: Use improved offset calculation
-            fallback_q = base_keyframes[keyframe_name].copy()
-            
-            # More accurate joint adjustments based on Jacobian estimates
-            # Joint 1 (base rotation): controls Y position (lateral)
-            # Joint 2 (shoulder): controls X position (forward/back)
-            
-            # Adjust joint 1 for lateral offset (Y direction)
-            # At 0.5m reach, ~1 rad ≈ 0.5m lateral movement
-            if abs(offset[1]) > 0.005:  # >5mm offset
-                fallback_q[0] += offset[1] * 2.0
-            
-            # Adjust joint 2 for forward/backward offset (X direction)  
-            # At 0.5m reach, ~0.1 rad ≈ 0.04m forward movement
-            if abs(offset[0]) > 0.005:  # >5mm offset
-                fallback_q[1] += offset[0] * 2.5
-            
-            # Verify fallback is reasonable
-            check_pos_fallback, _ = kin_helper.forward_kinematics(fallback_q)
-            fallback_error = np.linalg.norm(check_pos_fallback - target_pos)
-            
-            keyframes[keyframe_name] = fallback_q
-            print(f"  ⚠ IK failed for '{keyframe_name}', using offset fallback (error: {fallback_error*1000:.1f}mm)")
+            print(f"  X IK Failed for {keyframe_name} - using fallback")
+            fallback = initial_q.copy()
+            offset = object_pos - np.array([0.5, 0.0, 0.03])
+            fallback[0] += offset[1] * 2.0
+            fallback[1] += offset[0] * 2.0
+            keyframes[keyframe_name] = fallback
     
-    # Other keyframes derived from grasp position
     keyframes["grasp_closed"] = keyframes["grasp"]
-    keyframes["lift"] = keyframes["pre_grasp"]  # Lift to pre_grasp height
-    
-    # Transport and place keyframes (direct to bin, no intermediate waypoint)
-    keyframes["transport"] = np.array([0.4, 0.35, 0.0, -1.8, 0.1, 2.1, -0.55])  # Direct to above bin
-    keyframes["place"] = np.array([0.5, 0.3, 0.05, -1.7, 0.15, 2.0, -0.6])  # Position for release
-    keyframes["place_open"] = np.array([0.5, 0.3, 0.05, -1.7, 0.15, 2.0, -0.6])  # Open gripper
-    keyframes["hold_open"] = np.array([0.5, 0.3, 0.05, -1.7, 0.15, 2.0, -0.6])  # Brief hold to ensure drop
-    
+    keyframes["lift"] = keyframes["pre_grasp"]
+
+    # Load calibrated keyframes if available, otherwise use defaults
+    calibration_file = Path("data/calibrated_keyframes.json")
+
+    if calibration_file.exists():
+        # Use calibrated keyframes from GUI calibration
+        with calibration_file.open("r") as f:
+            calibration_data = json.load(f)
+
+        transport_q = np.array(calibration_data["keyframes"]["transport"]["joint_angles"])
+        place_q = np.array(calibration_data["keyframes"]["place"]["joint_angles"])
+
+        # Verify positions
+        transport_pos, _ = kin_helper.forward_kinematics(transport_q)
+        place_pos, _ = kin_helper.forward_kinematics(place_q)
+        bin_pos = env.bin_position
+
+        print(f"  Using CALIBRATED keyframes:")
+        print(f"    Transport: {transport_pos} (dist to bin: {np.linalg.norm(transport_pos[:2] - bin_pos[:2]):.3f}m)")
+        print(f"    Place: {place_pos} (dist to bin: {np.linalg.norm(place_pos[:2] - bin_pos[:2]):.3f}m)")
+    else:
+        # Fallback to hardcoded defaults (these work for standard bin position)
+        print(f"  ⚠ No calibration file found at {calibration_file}")
+        print(f"  Using default keyframes (may not be accurate!)")
+        print(f"  Run: mjpython data/calibrate_keyframes.py")
+
+        transport_q = np.array([0.4, 0.35, 0.0, -1.8, 0.1, 2.1, -0.55])
+        place_q = np.array([0.5, 0.3, 0.05, -1.7, 0.15, 2.0, -0.6])
+
+    # Add small noise to transport only (if noise is enabled)
+    if noisy_object_pos is not None:
+        transport_noise = np.random.normal(0, 0.03, 7)  # Small noise
+        transport_noise[4:] = 0  # Don't noise wrist
+        keyframes["transport"] = transport_q + transport_noise
+    else:
+        keyframes["transport"] = transport_q
+
+    # NO noise on place - always exact!
+    keyframes["place"] = place_q
+    keyframes["place_open"] = place_q
+
     return keyframes
 
 
@@ -272,99 +236,120 @@ def keyframe_policy(
     steps_at_keyframe: int,
     dwell_time: int = 20,
 ) -> tuple[np.ndarray, bool]:
-    """Keyframe-based policy for reliable pick-and-place.
-    
-    Args:
-        env: The Franka environment.
-        controller: KeyframeController managing waypoint sequence.
-        steps_at_keyframe: Number of steps at current keyframe.
-        dwell_time: Minimum timesteps to dwell at each keyframe before checking convergence.
-    
-    Returns:
-        Tuple of (action, sequence_complete):
-            - action: 8D action vector (7 joint positions + 1 gripper position)
-            - sequence_complete: True if all keyframes have been reached
-    """
-    # Get current keyframe target
+    """Keyframe-based policy using P-Control (NO noise injection - diversity comes from position noise)."""
+    # 1. Get targets
     keyframe_name, target_q = controller.get_current_target()
-    
-    # Get current joint state
+
+    # 2. Get current state
     current_q = env.data.qpos[env._joint_qpos_indices].copy()
     current_qvel = env.data.qvel[env._joint_dof_indices].copy()
-    
-    # ULTRA-DENSE DEMOS: Almost pure threshold-based transitions
-    # Minimal dwell times - transitions happen immediately when criteria met
-    if keyframe_name == "grasp":
-        required_dwell = 2   # Just ensure contact stability
-    elif keyframe_name == "grasp_closed":
-        required_dwell = 3   # Brief hold to secure grip (physics stability)
-    elif keyframe_name == "hold_open":
-        required_dwell = 8   # Hold after opening to ensure ball drops and settles
+
+    # NO NOISE INJECTION HERE - diversity comes from noisy object positions at keyframe computation
+    # This ensures precise execution of the planned trajectory
+
+    # --- P-CONTROLLER (Position Control with Smoothing) ---
+    error = target_q - current_q
+
+    kp = 0.25  # Smooth motion
+    target_position = current_q + kp * error
+
+    # --- CONVERGENCE CHECK ---
+    dist = np.max(np.abs(target_q - current_q))
+    vel_mag = np.max(np.abs(current_qvel))
+
+    # --- FIX 2: DWELL TIME & CONVERGENCE ---
+    if keyframe_name == "grasp_closed":
+        required_dwell = 10  # Wait longer to ensure grip is solid
+        is_converged = True  # We trust the time duration
+    elif keyframe_name == "grasp":
+        required_dwell = 5
+        is_converged = dist < 0.10
+    elif keyframe_name == "place":
+        required_dwell = 10  # Give it more time to settle
+        is_converged = dist < 0.20 or steps_at_keyframe >= 15  # More lenient threshold OR timeout
+    elif keyframe_name == "place_open":
+        required_dwell = 20  # Hold position after opening to let ball drop
+        is_converged = True  # Trust time duration
     else:
-        required_dwell = 1   # Single step minimum (immediate transition)
-    
-    # Check if we've converged and dwelled long enough
-    if steps_at_keyframe >= required_dwell and controller.check_convergence(current_q, current_qvel, target_q):
-        # Try to advance to next keyframe
+        required_dwell = 1
+        is_converged = dist < 0.20
+
+    # Debug Prints
+    if steps_at_keyframe % 10 == 0:
+        print(f"  [DEBUG] {keyframe_name} | Err: {dist:.3f} | Vel: {vel_mag:.3f} | Step: {steps_at_keyframe}")
+
+    if steps_at_keyframe >= required_dwell and is_converged:
+        print(f"  ✓ Reached {keyframe_name}!")
         controller.advance_to_next_keyframe()
-    
-    # Build action: position control for arm + gripper command
+
+    # 3. Construct Action
     action = np.zeros(8)
-    action[:7] = target_q
-    
-    # Gripper control based on keyframe name
-    # Keep gripper FIRMLY closed during all carrying phases
+    action[:7] = target_position
+
+    # --- FIX 3: GRIPPER CONTROL ---
+    # Strong grip during pick and transport, open for place
     if "closed" in keyframe_name or keyframe_name in ["lift", "transport", "place"]:
-        action[7] = 0.0  # Fully closed gripper (0.0m = maximum grip)
+        action[7] = -0.01  # Closed: maximum grip
+    elif keyframe_name in ["place_open"]:
+        action[7] = 0.04  # Open: release ball
     else:
-        action[7] = 0.04  # Open gripper (0.04m = fully open) for approach, grasp, pre_grasp, place_open, hold_open
-    
-    sequence_complete = controller.is_sequence_complete()
-    
-    return action, sequence_complete
+        action[7] = 0.04  # Default: open
+
+    return action, controller.is_sequence_complete()
 
 
-def collect_episode(env: FrankaPickPlaceEnv, hindered: bool, max_steps: int) -> EpisodeBuffer:
+def collect_episode(env: FrankaPickPlaceEnv, hindered: bool, max_steps: int, add_noise: bool = True) -> EpisodeBuffer:
     obs, info = env.reset(hindered=hindered)
     buffer = EpisodeBuffer(
         rgb_frames=[],
         proprio=[],
         actions=[],
         timestamps=[],
-        object_positions=[],  # NEW: Initialize empty list for object positions
+        object_positions=[],
         instruction=info["instruction"],
         meta=info,
     )
 
-    # Get target object position
+    # Get target object position (actual/ground truth)
     target_color = env.target_color
     target_site_id = env._object_site_ids[target_color]
     object_pos = env.data.site_xpos[target_site_id].copy()
-    
-    print(f"Starting episode | Target: {target_color} at {object_pos} | Hindered: {hindered}")
-    
+
+    # Add noise to object position for trajectory diversity
+    # This creates different approach paths while still grasping at the actual location
+    noisy_object_pos = None
+    if add_noise:
+        # Add XY noise for diverse approaches (not Z - keep height accurate)
+        xy_noise_std = 0.02  # 2cm standard deviation in XY
+        xy_noise = np.random.normal(0, xy_noise_std, 2)
+        noisy_object_pos = object_pos.copy()
+        noisy_object_pos[:2] += xy_noise
+        print(f"Starting episode | Target: {target_color} at {object_pos} | Noisy approach: {noisy_object_pos} | Hindered: {hindered}")
+    else:
+        print(f"Starting episode | Target: {target_color} at {object_pos} | Hindered: {hindered}")
+
     # Create kinematics helper for adaptive IK
     kin_helper = KinematicsHelper(env.model, site_name="gripper")
-    
-    # Compute adaptive keyframes for this object position
-    keyframes = compute_adaptive_keyframes(env, object_pos, kin_helper)
+
+    # Compute adaptive keyframes: noisy position for pre_grasp, actual for grasp
+    keyframes = compute_adaptive_keyframes(env, object_pos, kin_helper, noisy_object_pos)
     
     # Initialize keyframe controller
     controller = KeyframeController(
         keyframes=keyframes,
-        convergence_threshold=0.08,  # 0.08 radians (~4.5 degrees)
-        velocity_threshold=0.15,      # 0.15 rad/s
+        convergence_threshold=0.20,
+        velocity_threshold=1.0,
     )
     
-    # Set pick-and-place sequence (direct transport, no intermediate waypoint)
+    # Skip 'home' to avoid getting stuck at start
     pick_place_sequence = [
-        "home", "pre_grasp", "grasp", "grasp_closed", "lift",
-        "transport", "place", "place_open", "hold_open"  # End with hold_open to ensure ball drops
+        "pre_grasp", "grasp", "grasp_closed", "lift",
+        "transport", "place", "place_open"
     ]
     controller.set_sequence(pick_place_sequence)
 
     timestamp = 0.0
-    steps_at_keyframe = 0  # Track steps at current keyframe
+    steps_at_keyframe = 0
     prev_keyframe_idx = 0
     
     for step_idx in range(max_steps):
@@ -394,39 +379,24 @@ def collect_episode(env: FrankaPickPlaceEnv, hindered: bool, max_steps: int) -> 
         if env.viewer is not None:
             env.viewer.sync()
         
-        # Log progress
-        if step_idx % 50 == 0:
-            current_keyframe, _ = controller.get_current_target()
-            progress = controller.get_progress()
-            print(f"  Step {step_idx:3d} | Keyframe [{progress[0]}/{progress[1]}] {current_keyframe}")
-        
-        # Check termination conditions
         if result.terminated or result.truncated:
             print(f"  Episode terminated at step {step_idx}")
             break
         
-        # End only when sequence complete AND ball is successfully in box
+        # End when sequence complete (all keyframes reached)
         if sequence_complete:
             # Check if ball is actually in the box (success condition)
             obj_pos = env.data.site_xpos[target_site_id]
             horizontal_dist = np.linalg.norm(obj_pos[:2] - env.bin_position[:2])
             obj_in_bin = horizontal_dist < env.bin_radius and obj_pos[2] < 0.08
-            
+
             if obj_in_bin:
                 print(f"  ✓ Ball in box! Episode complete at step {step_idx}")
-                break
-            elif step_idx >= 150:
-                # Safety: end after 150 steps even if not successful (prevents infinite loop)
-                print(f"  ⚠ Max steps reached, ending episode (ball not in box)")
-                break
+            else:
+                print(f"  ⚠ Ball NOT in box (dist={horizontal_dist:.3f}, z={obj_pos[2]:.3f}) at step {step_idx}")
+            break
 
-    buffer.meta.update(
-        {
-            "episode_length": len(buffer.actions),
-            "control_dt": env.step_dt,
-            "sequence_complete": sequence_complete,
-        }
-    )
+    buffer.meta.update({"episode_length": len(buffer.actions), "sequence_complete": sequence_complete})
     return buffer
 
 
@@ -466,6 +436,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=600, help="Maximum steps per episode for full pick-and-place.")
     parser.add_argument("--seed", type=int, default=0, help="Random seed for reproducibility.")
     parser.add_argument("--gui", action="store_true", help="Enable the interactive MuJoCo viewer.")
+    parser.add_argument("--no-noise", action="store_true", help="Disable position noise for deterministic trajectories.")
     parser.add_argument(
         "--asset-root",
         type=Path,
@@ -504,14 +475,13 @@ def main() -> None:
     rng = np.random.default_rng(args.seed)
     hindered_fraction = float(np.clip(args.hindered_fraction, 0.0, 1.0))
 
-    # Skip random numbers for episodes we've already collected to maintain reproducibility
-    for _ in range(start_episode):
-        rng.random()
+    for _ in range(start_episode): rng.random()
 
     # Continue from where we left off
     for episode_idx in range(start_episode, args.episodes):
         hindered = rng.random() < hindered_fraction
-        buffer = collect_episode(env, hindered=hindered, max_steps=args.max_steps)
+        add_noise = not args.no_noise  # Add noise by default, unless --no-noise is specified
+        buffer = collect_episode(env, hindered=hindered, max_steps=args.max_steps, add_noise=add_noise)
         buffer.save(dataset_root, episode_idx)
         metadata.append({
             "episode": f"episode_{episode_idx:04d}",

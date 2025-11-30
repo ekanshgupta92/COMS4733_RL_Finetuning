@@ -17,6 +17,10 @@ model:
   max_instruction_tokens: 64
   freeze_vision: false  # CRITICAL: Allow vision encoder to learn task-specific features
   freeze_language: true  # Freeze BERT to reduce overfitting (simple instructions, pretrained is enough)
+
+  freeze_vision: true   # Set to TRUE. 300 demos is too small to fine-tune DINO.
+  freeze_language: true
+  
   dropout: 0.15  # Reduced from 0.1 to retain more learned features
   history_length: 5  # Number of past actions for closed-loop control (sweet spot: not too short, not too long)
   use_object_detection: true  # Multi-task learning with PERFECT ground truth from MuJoCo!

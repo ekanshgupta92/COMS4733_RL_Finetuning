@@ -74,9 +74,23 @@ class VLADinoV2Policy(nn.Module):
         )
         self.fusion = nn.TransformerEncoder(encoder_layer, num_layers=config.fusion_layers)
 
-        self.head = nn.Sequential(
+        # self.head = nn.Sequential(
+        #     nn.LayerNorm(config.fusion_hidden_dim),
+        #     nn.Linear(config.fusion_hidden_dim, config.action_dim),
+        # )
+
+        # Arm Head: Predicts 7 joint positions
+        self.arm_head = nn.Sequential(
             nn.LayerNorm(config.fusion_hidden_dim),
-            nn.Linear(config.fusion_hidden_dim, config.action_dim),
+            nn.Linear(config.fusion_hidden_dim, 7),
+            # Optional: Tanh if you normalized actions to [-1, 1]
+            # nn.Tanh() 
+        )
+
+        # Gripper Head: Predicts Logits for Binary Classification (Open/Close)
+        self.gripper_head = nn.Sequential(
+            nn.LayerNorm(config.fusion_hidden_dim),
+            nn.Linear(config.fusion_hidden_dim, 1), 
         )
 
         # Value head for RL (critic)
@@ -131,7 +145,26 @@ class VLADinoV2Policy(nn.Module):
             action_history: Batch of past actions ``(B, history_length, action_dim)`` or None.
         """
         pooled = self._get_fused_features(rgb_static, instruction, proprio, action_history)
-        return self.head(pooled)
+        # Predict separate components
+        arm_preds = self.arm_head(pooled)       # (B, 7)
+        gripper_logits = self.gripper_head(pooled) # (B, 1)
+        
+        # Return concatenated vector
+        return torch.cat([arm_preds, gripper_logits], dim=1)
+    
+    # Helper to get actual actionable commands (inference time)
+    def predict_action(self, rgb_static, instruction, proprio, action_history=None):
+        out = self.forward(rgb_static, instruction, proprio, action_history)
+        arm = out[:, :7]
+        gripper_logit = out[:, 7:]
+        
+        # Convert logit to probability, then to action
+        gripper_prob = torch.sigmoid(gripper_logit)
+        # Threshold: if prob > 0.5 -> Open (0.04), else Closed (0.0)
+        # 1 = Open, 0 = Closed.
+        gripper_action = (gripper_prob > 0.5).float() * 0.04
+        
+        return torch.cat([arm, gripper_action], dim=1)
 
     def _get_fused_features(
         self,
