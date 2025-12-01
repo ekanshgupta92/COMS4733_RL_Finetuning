@@ -155,7 +155,7 @@ class FrankaPickPlaceEnv:
         self._randomize_robot_pose()
         self._active_objects = self._randomize_objects()
         self._target_color = self.rng.choice(self._active_objects)
-        self._instruction = f"Pick up the {self._target_color} sphere and place it in the goal bin."
+        self._instruction = f"Pick up the {self._target_color} cube and place it in the goal bin."
         self._apply_hindered_modifications()
 
         mujoco.mj_forward(self.model, self.data)
@@ -312,22 +312,22 @@ class FrankaPickPlaceEnv:
         count = int(self.rng.integers(3, len(_OBJECT_COLORS) + 1))
         active = tuple(self.rng.choice(_OBJECT_COLORS, size=count, replace=False))
         
-        # Track placed ball positions to prevent overlap
+        # Track placed cube positions to prevent overlap
         placed_positions = []
-        min_separation = 0.07  # 7cm minimum distance (ball diameter ~6cm + 1cm buffer)
+        min_separation = 0.07  # 7cm minimum distance (cube size 5cm + 2cm buffer)
         
         for color in _OBJECT_COLORS:
             addr = self._object_qpos_addrs[color]
             if color in active:
-                # Place objects in the working zone (0.45-0.55m forward, ±0.25m lateral)
+                # Place cubes in the working zone (0.45-0.55m forward, ±0.25m lateral)
                 # This range has proven successful grasping with our keyframes
                 # Try up to 50 times to find a non-overlapping position
                 for attempt in range(50):
                     x = self.rng.uniform(0.45, 0.55)
                     y = self.rng.uniform(-0.25, 0.25)
-                    pos = np.array([x, y, 0.035], dtype=np.float64)
+                    pos = np.array([x, y, 0.025], dtype=np.float64)  # Cube center height (5cm cube)
                     
-                    # Check if this position overlaps with any existing balls
+                    # Check if this position overlaps with any existing cubes
                     overlap = False
                     for existing_pos in placed_positions:
                         dist = np.linalg.norm(pos[:2] - existing_pos[:2])

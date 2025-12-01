@@ -127,6 +127,41 @@ def _quat_to_axis_angle(quat: np.ndarray) -> np.ndarray:
     return axis * angle
 
 
+def rotation_matrix_to_angular_error(R: np.ndarray) -> np.ndarray:
+    """
+    Convert rotation matrix error to angular velocity (from Simple-MuJoCo).
+    This is more robust than quaternion-based error for IK.
+    
+    Args:
+        R: 3x3 rotation matrix representing error
+    
+    Returns:
+        3D angular error vector
+    """
+    el = np.array([
+        [R[2, 1] - R[1, 2]],
+        [R[0, 2] - R[2, 0]], 
+        [R[1, 0] - R[0, 1]]
+    ])
+    norm_el = np.linalg.norm(el)
+    if norm_el > 1e-10:
+        w = np.arctan2(norm_el, np.trace(R) - 1) / norm_el * el
+    elif R[0, 0] > 0 and R[1, 1] > 0 and R[2, 2] > 0:
+        w = np.array([[0, 0, 0]]).T
+    else:
+        w = np.pi / 2 * np.array([[R[0, 0] + 1], [R[1, 1] + 1], [R[2, 2] + 1]])
+    return w.flatten()
+
+
+def trim_scale(x: np.ndarray, th: float) -> np.ndarray:
+    """Trim scale to prevent large jumps (from Simple-MuJoCo)."""
+    x = np.copy(x)
+    x_abs_max = np.abs(x).max()
+    if x_abs_max > th:
+        x = x * th / x_abs_max
+    return x
+
+
 class KinematicsHelper:
     """Provides FK/IK and Jacobian utilities for the Franka arm."""
 
@@ -400,6 +435,82 @@ class KinematicsHelper:
         null_cmd = null_proj @ (gains * home_error)
         return null_cmd
 
+    def inverse_kinematics_robust(
+        self,
+        target_pos: Sequence[float],
+        target_R: np.ndarray,
+        *,
+        initial_q: Optional[Sequence[float]] = None,
+        max_iters: int = 200,
+        tol: float = 1e-2,
+        step_limit: float = np.radians(5.0),
+    ) -> np.ndarray:
+        """
+        Robust IK solver using rotation matrix error (from Simple-MuJoCo).
+        More stable than quaternion-based approach for difficult poses.
+        
+        Args:
+            target_pos: Target position [x, y, z]
+            target_R: Target rotation matrix (3x3)
+            initial_q: Initial joint configuration
+            max_iters: Maximum iterations
+            tol: Convergence tolerance
+            step_limit: Maximum joint change per iteration
+        
+        Returns:
+            Joint configuration that reaches target
+        """
+        q = np.asarray(
+            initial_q if initial_q is not None else self.model.qpos0[self.joint_info.qpos_indices],
+            dtype=np.float64
+        )
+        target_pos = np.asarray(target_pos, dtype=np.float64)
+        
+        for iteration in range(max_iters):
+            # Forward kinematics
+            self._apply_configuration(q)
+            mujoco.mj_forward(self.model, self.data)
+            
+            # Current pose
+            pos_curr = self.data.site_xpos[self.site_id].copy()
+            R_curr = self.data.site_xmat[self.site_id].reshape(3, 3).copy()
+            
+            # Position error
+            pos_err = target_pos - pos_curr
+            
+            # Rotation error using robust matrix approach
+            R_err = np.linalg.solve(R_curr, target_R)
+            w_err = R_curr @ rotation_matrix_to_angular_error(R_err)
+            
+            # Combined 6D error
+            err = np.concatenate([pos_err, w_err])
+            err_norm = np.linalg.norm(err)
+            
+            # Check convergence
+            if err_norm < tol:
+                return q
+            
+            # Compute Jacobian
+            jacp = np.zeros((3, self.model.nv))
+            jacr = np.zeros((3, self.model.nv))
+            mujoco.mj_jacSite(self.model, self.data, jacp, jacr, self.site_id)
+            cols = self.joint_info.dof_indices
+            J = np.vstack([jacp[:, cols], jacr[:, cols]])
+            
+            # Damped least squares
+            eps = 0.1
+            dq = np.linalg.solve(J.T @ J + eps * np.eye(J.shape[1]), J.T @ err)
+            
+            # Limit step size to prevent large jumps
+            dq = trim_scale(dq, step_limit)
+            
+            # Update configuration
+            q = q + dq
+            q = self._clamp_to_limits(q)
+        
+        # Return best effort if not converged
+        return q
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -416,6 +527,100 @@ class KinematicsHelper:
             if np.isfinite(upper):
                 q[i] = min(q[i], upper)
         return q
+
+
+class PIDController:
+    """PID Controller for torque control (from Simple-MuJoCo)."""
+    
+    def __init__(
+        self,
+        dim: int = 7,
+        k_p: float = 800.0,
+        k_i: float = 20.0,
+        k_d: float = 100.0,
+        dt: float = 0.002,
+        out_min: Optional[np.ndarray] = None,
+        out_max: Optional[np.ndarray] = None,
+        anti_windup: bool = True,
+    ):
+        """
+        Initialize PID controller.
+        
+        Args:
+            dim: Control dimension
+            k_p: Proportional gain
+            k_i: Integral gain
+            k_d: Derivative gain
+            dt: Time step
+            out_min: Minimum output values
+            out_max: Maximum output values
+            anti_windup: Enable anti-windup
+        """
+        self.dim = dim
+        self.k_p = k_p
+        self.k_i = k_i
+        self.k_d = k_d
+        self.dt = dt
+        self.anti_windup = anti_windup
+        
+        # Output limits
+        self.out_min = out_min if out_min is not None else np.full(dim, -np.inf)
+        self.out_max = out_max if out_max is not None else np.full(dim, np.inf)
+        
+        # State
+        self.reset()
+    
+    def reset(self):
+        """Reset PID state."""
+        self.x_target = np.zeros(self.dim)
+        self.x_current = np.zeros(self.dim)
+        self.err_current = np.zeros(self.dim)
+        self.err_integral = np.zeros(self.dim)
+        self.err_prev = np.zeros(self.dim)
+        self.output = np.zeros(self.dim)
+    
+    def set_target(self, x_target: np.ndarray):
+        """Set target position."""
+        self.x_target = np.asarray(x_target, dtype=np.float64)
+    
+    def update(self, x_current: np.ndarray, dt: Optional[float] = None) -> np.ndarray:
+        """
+        Update PID controller and compute output.
+        
+        Args:
+            x_current: Current state
+            dt: Time step (uses default if None)
+        
+        Returns:
+            Control output (torque)
+        """
+        self.x_current = np.asarray(x_current, dtype=np.float64)
+        dt = dt if dt is not None else self.dt
+        
+        # Compute error
+        self.err_current = self.x_target - self.x_current
+        
+        # Integral term with anti-windup
+        self.err_integral = self.err_integral + self.err_current * dt
+        if self.anti_windup:
+            # Reset integral when output is saturated and error has opposite sign
+            err_out = self.err_current * self.output
+            self.err_integral[err_out < 0.0] = 0.0
+        
+        # Derivative term
+        err_diff = self.err_current - self.err_prev
+        
+        # PID output
+        p_term = self.k_p * self.err_current
+        i_term = self.k_i * self.err_integral
+        d_term = self.k_d * err_diff / dt if dt > 1e-6 else np.zeros(self.dim)
+        
+        self.output = np.clip(p_term + i_term + d_term, self.out_min, self.out_max)
+        
+        # Store for next iteration
+        self.err_prev = self.err_current
+        
+        return self.output
 
 
 class KeyframeController:
@@ -542,8 +747,11 @@ __all__ = [
     "JointVelocityControllerConfig",
     "KinematicsHelper",
     "KeyframeController",
+    "PIDController",
     "compute_pick_place_keyframes",
     "infer_actuated_joints",
+    "rotation_matrix_to_angular_error",
+    "trim_scale",
 ]
 
 # Export quaternion utilities for orientation control
